@@ -17,9 +17,12 @@ limitations under the License.
 #define TENSORFLOW_CORE_TFRT_IFRT_SHARDING_UTILS_H_
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/container/inlined_vector.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
 #include "xla/hlo/ir/hlo_sharding.h"
@@ -28,14 +31,58 @@ limitations under the License.
 #include "xla/python/ifrt/device.h"
 #include "xla/python/ifrt/device_list.h"
 #include "xla/tsl/concurrency/future.h"
-#include "xla/tsl/concurrency/ref_count.h"
 #include "xla/tsl/platform/threadpool.h"
+#include "xla/xla_data.pb.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/framework/tensor_shape.h"
 #include "tensorflow/core/framework/types.pb.h"
 
 namespace tensorflow {
 namespace ifrt_serving {
+
+// A per-request H2D transfer executor.
+class H2DTransferExecutor {
+ public:
+  // TODO(b/445201291): Make the constructor private once the
+  // H2DTransferExecutorFactory is plumbed through the stack.
+  explicit H2DTransferExecutor(xla::ifrt::Client& ifrt_client);
+  virtual ~H2DTransferExecutor() = default;
+
+  // Registers a tensor to be transferred to devices. The H2D transfer can be
+  // started in this call or in a later call of `GetArrays`.
+  virtual absl::Status RegisterH2DTransfer(
+      const tensorflow::Tensor& tensor,
+      const xla::ifrt::DeviceListRef& device_list,
+      const xla::OpSharding& sharding, int arg_index,
+      tsl::thread::ThreadPool& thread_pool);
+
+  // Returns the arrays for all registered tensors. This can only be called
+  // once and must be called after `RegisterH2DTransfer` is called for all host
+  // tensors.
+  virtual absl::StatusOr<absl::flat_hash_map<int, xla::ifrt::ArrayRef>>
+  GetArrays();
+
+ private:
+  struct H2DTransferBundle {
+    tensorflow::Tensor tensor;
+    xla::ifrt::DeviceListRef device_list;
+    xla::OpSharding sharding;
+    tsl::thread::ThreadPool* thread_pool;
+  };
+
+  xla::ifrt::Client& ifrt_client_;
+  // H2D transfers for large tensors.
+  absl::flat_hash_map<int, xla::ifrt::ArrayRef> ifrt_arrays_;
+
+  bool array_got_ = false;
+};
+
+class H2DTransferExecutorFactory {
+ public:
+  virtual ~H2DTransferExecutorFactory() = default;
+  virtual std::unique_ptr<H2DTransferExecutor> CreateH2DTransferExecutor(
+      xla::ifrt::Client& ifrt_client) = 0;
+};
 
 // Create a tensor from the given host tensor based on given device ids and
 // sharding information.

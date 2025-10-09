@@ -268,19 +268,6 @@ IfrtServingExecutable::Create(
   return executable;
 }
 
-absl::StatusOr<xla::ifrt::ArrayRef> IfrtServingExecutable::ConvertTensorToArray(
-    const tensorflow::Tensor& tensor,
-    const xla::ifrt::DeviceListRef& device_list,
-    const xla::OpSharding& sharding) {
-  xla::ifrt::Shape input_shape = ToIfrtShape(tensor.shape());
-  VLOG(2) << "Converting tensor of shape " << input_shape;
-
-  TF_ASSIGN_OR_RETURN(auto hlo_sharding, xla::HloSharding::FromProto(sharding));
-
-  return MakeArrayFromTensor(*ifrt_client_, tensor, device_list,
-                             std::move(hlo_sharding), thread_pool_);
-}
-
 absl::StatusOr<std::vector<tensorflow::FunctionDef>> BuildFunctionDef(
     mlir::ModuleOp module) {
   std::vector<tensorflow::FunctionDef> function_defs;
@@ -719,8 +706,17 @@ absl::StatusOr<std::vector<tensorflow::Tensor>> IfrtServingExecutable::Execute(
     device_ids.push_back(device->Id().value());
   }
   std::vector<xla::ifrt::ArrayRef> args;
+  std::vector<std::pair<int64_t, tsl::Future<xla::ifrt::ArrayRef>>> user_inputs;
+  user_inputs.reserve(inputs.size() - variable_arg_indices.size());
   args.reserve(inputs.size());
   int variable_arg_index = 0;
+  // TODO(b/445201291): Plumb the H2DTransferExecutorFactory from the
+  // IfrtServingExecutable constructor.
+  std::unique_ptr<H2DTransferExecutor> user_inputs_h2d_transfer_executor =
+      h2d_transfer_executor_factory_ != nullptr
+          ? h2d_transfer_executor_factory_->CreateH2DTransferExecutor(
+                *ifrt_client_)
+          : std::make_unique<H2DTransferExecutor>(*ifrt_client_);
   for (int i = 0; i < inputs.size(); i++) {
     if (variable_arg_index < variable_arg_indices.size() &&
         i == variable_arg_indices[variable_arg_index]) {
@@ -754,15 +750,21 @@ absl::StatusOr<std::vector<tensorflow::Tensor>> IfrtServingExecutable::Execute(
         return absl::InternalError("Failed to reshape tensor");
       }
 
-      TF_ASSIGN_OR_RETURN(
-          auto single_array,
-          ConvertTensorToArray(
-              reshaped, device_list,
-              executable_bundle->compile_metadata.args()[i].sharding()));
-      args.push_back(single_array);
+      TF_RETURN_IF_ERROR(user_inputs_h2d_transfer_executor->RegisterH2DTransfer(
+          reshaped, device_list,
+          executable_bundle->compile_metadata.args()[i].sharding(), args.size(),
+          thread_pool_));
+      args.push_back(xla::ifrt::ArrayRef());
     }
   }
   DCHECK_EQ(args.size(), executable_bundle->compile_metadata.args().size());
+
+  TF_ASSIGN_OR_RETURN(auto transfer_result,
+                      user_inputs_h2d_transfer_executor->GetArrays());
+
+  for (auto& [original_index, array_ref] : transfer_result) {
+    args[original_index] = std::move(array_ref);
+  }
 
   VLOG(2) << "Start Execution";
 

@@ -25,6 +25,7 @@ limitations under the License.
 #include <vector>
 
 #include "absl/container/btree_map.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/container/inlined_vector.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
@@ -644,6 +645,41 @@ absl::StatusOr<tsl::Future<tensorflow::Tensor>> MakeTensorFromArrayHelper(
 }
 
 }  // namespace
+
+std::unique_ptr<H2DTransferExecutor>
+H2DTransferExecutorFactory::CreateH2DTransferExecutor(
+    xla::ifrt::Client& ifrt_client) {
+  return std::make_unique<H2DTransferExecutor>(ifrt_client);
+}
+
+H2DTransferExecutor::H2DTransferExecutor(xla::ifrt::Client& ifrt_client)
+    : ifrt_client_(ifrt_client) {}
+
+absl::Status H2DTransferExecutor::RegisterH2DTransfer(
+    const tensorflow::Tensor& tensor,
+    const xla::ifrt::DeviceListRef& device_list,
+    const xla::OpSharding& sharding, int arg_index,
+    tsl::thread::ThreadPool& thread_pool) {
+  TF_ASSIGN_OR_RETURN(auto hlo_sharding, xla::HloSharding::FromProto(sharding));
+  TF_ASSIGN_OR_RETURN(ifrt_arrays_[arg_index],
+                      MakeArrayFromTensor(ifrt_client_, tensor, device_list,
+                                          hlo_sharding, thread_pool));
+  return absl::OkStatus();
+}
+
+absl::StatusOr<absl::flat_hash_map<int, xla::ifrt::ArrayRef>>
+H2DTransferExecutor::GetArrays() {
+  if (array_got_) {
+    return absl::FailedPreconditionError("GetArrays can only be called once.");
+  }
+  array_got_ = true;
+
+  absl::flat_hash_map<int, xla::ifrt::ArrayRef> result;
+  for (auto& [idx, array_ref] : ifrt_arrays_) {
+    result.insert({idx, std::move(array_ref)});
+  }
+  return result;
+}
 
 tsl::Future<tensorflow::Tensor> MakeTensorFromArray(
     xla::ifrt::Client& ifrt_client, xla::ifrt::Array& input_array,
