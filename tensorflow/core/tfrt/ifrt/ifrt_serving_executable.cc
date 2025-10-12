@@ -590,11 +590,11 @@ IfrtServingExecutable::LookUpOrCreateExecutable(
       return it->second;
     }
 
-    if (is_frozen_) {
+    if (is_frozen_ || tf_to_hlo_compiler_->IsXlaCompilationDisabled()) {
       tsl::Future<SharedCachedExecutableBundle> frozen_future(
           absl::FailedPreconditionError(
               "Cannot compile for new input shapes after the executable is "
-              "already frozen."));
+              "already frozen or XLA compilation disabled."));
       return frozen_future;
     }
 
